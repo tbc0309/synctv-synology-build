@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   build:
-    name: DSM 7.2 ${{ matrix.synology_arch }}
+    name: DSM 7.1 ${{ matrix.synology_arch }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -29,17 +29,17 @@ jobs:
           - synology_arch: amd64
             rust_target: x86_64-unknown-linux-gnu
             platform: avoton
-            toolchain_file: avoton-gcc1220_glibc236_x86_64-GPL.txz
-            toolchain_md5: d0673f47d00624140c2e3a0d3d901080
+            toolchain_file: avoton-gcc850_glibc226_x86_64-GPL.txz
+            toolchain_md5: 93e6ae9501327554c51a1e045e1b69a1
             archive_path: Intel%20x86%20Linux%203.10.108%20%28Avoton%29
           - synology_arch: armv8
             rust_target: aarch64-unknown-linux-gnu
             platform: rtd1296
-            toolchain_file: rtd1296-gcc1220_glibc236_armv8-GPL.txz
-            toolchain_md5: 3fa5a0b496a298af7ee28e457959be31
-            archive_path: Realtek%20RTD129x%20Linux%204.4.302
+            toolchain_file: rtd1296-gcc850_glibc226_armv8-GPL.txz
+            toolchain_md5: 370aec3c42dd6d9336b82c6a46e7f105
+            archive_path: Realtek%20RTD129x%20Linux%204.4.180
     env:
-      DSM_TOOLCHAIN_VERSION: 7.2-72806
+      DSM_TOOLCHAIN_VERSION: 7.1-42661
       SQLX_OFFLINE: "true"
       CARGO_INCREMENTAL: "0"
       CARGO_TERM_COLOR: always
@@ -121,15 +121,15 @@ jobs:
           mkdir -p dist
           cp "${binary}" "dist/synctv"
           cp LICENSE "dist/LICENSE"
-          tar -C dist -cJf "synctv-dsm72-${{ matrix.synology_arch }}.tar.xz" synctv LICENSE
-          sha256sum "synctv-dsm72-${{ matrix.synology_arch }}.tar.xz" > "synctv-dsm72-${{ matrix.synology_arch }}.tar.xz.sha256"
+          tar -C dist -cJf "synctv-dsm71-${{ matrix.synology_arch }}.tar.xz" synctv LICENSE
+          sha256sum "synctv-dsm71-${{ matrix.synology_arch }}.tar.xz" > "synctv-dsm71-${{ matrix.synology_arch }}.tar.xz.sha256"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: synctv-dsm72-${{ matrix.synology_arch }}
+          name: synctv-dsm71-${{ matrix.synology_arch }}
           path: |
-            synctv-dsm72-${{ matrix.synology_arch }}.tar.xz
-            synctv-dsm72-${{ matrix.synology_arch }}.tar.xz.sha256
+            synctv-dsm71-${{ matrix.synology_arch }}.tar.xz
+            synctv-dsm71-${{ matrix.synology_arch }}.tar.xz.sha256
           if-no-files-found: error
           retention-days: 30
