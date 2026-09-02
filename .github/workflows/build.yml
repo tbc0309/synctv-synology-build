@@ -1,5 +1,9 @@
 name: Build and publish Synology binaries
 on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/build.yml
   workflow_dispatch:
     inputs:
       ref:
@@ -30,7 +34,8 @@ jobs:
           set -euo pipefail
           upstream_ref="${REQUESTED_REF}"
           if [[ -z "${upstream_ref}" ]]; then
-            upstream_ref="$(git ls-remote --tags --refs https://github.com/synctv-org/synctv.git 'v*' | sed 's#.*refs/tags/##' | sort -V | tail -n 1)"
+            # GitHub's latest-release endpoint excludes drafts and prereleases.
+            upstream_ref="$(gh api repos/synctv-org/synctv/releases/latest --jq .tag_name)"
           fi
           [[ "${upstream_ref}" == v* ]] || { echo "Expected a v* tag: ${upstream_ref}" >&2; exit 1; }
           git ls-remote --exit-code --tags https://github.com/synctv-org/synctv.git "refs/tags/${upstream_ref}" >/dev/null
@@ -46,6 +51,7 @@ jobs:
     if: needs.prepare.outputs.should_build == 'true'
     name: DSM 7.1 ${{ matrix.synology_arch }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -92,6 +98,12 @@ jobs:
         with:
           toolchain: ${{ steps.rust-toolchain.outputs.channel }}
           targets: ${{ matrix.rust_target }}
+      - name: Show build environment
+        run: |
+          rustc --version --verbose
+          cargo --version
+          free -h
+          df -h "${RUNNER_TEMP}"
       - uses: Swatinem/rust-cache@v2
         with:
           key: synology-${{ matrix.synology_arch }}
@@ -123,9 +135,16 @@ jobs:
             --features "tls-ring,tls-webpki-roots"
       - name: Prepare uncompressed binary
         run: |
+          set -euo pipefail
           output="synctv-dsm71-${{ matrix.synology_arch }}"
           cp "target/${{ matrix.rust_target }}/release/synctv" "${output}"
           chmod 755 "${output}"
+          case "${{ matrix.synology_arch }}" in
+            amd64) expected_machine='Advanced Micro Devices X86-64' ;;
+            armv8) expected_machine='AArch64' ;;
+            *) exit 1 ;;
+          esac
+          readelf -h "${output}" | grep -F "Machine:" | grep -F "${expected_machine}"
           sha256sum "${output}" > "${output}.sha256"
       - uses: actions/upload-artifact@v4
         with:
