@@ -107,6 +107,39 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: synology-${{ matrix.synology_arch }}
+      - name: Disable incompatible Opus AVX2 on DSM 7.1 amd64
+        if: matrix.synology_arch == 'amd64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fetch --locked --target "${{ matrix.rust_target }}"
+          opusic_version="$(awk '
+            $0 == "name = \"opusic-sys\"" { found = 1; next }
+            found && /^version = / { gsub(/[\" ]/, "", $3); print $3; exit }
+          ' Cargo.lock)"
+          [[ -n "${opusic_version}" ]] || { echo 'opusic-sys is missing from Cargo.lock' >&2; exit 1; }
+          mapfile -t build_scripts < <(
+            find "${CARGO_HOME}/registry/src" -path "*/opusic-sys-${opusic_version}/build.rs" -type f
+          )
+          [[ "${#build_scripts[@]}" -eq 1 ]] || {
+            printf 'Expected one opusic-sys build.rs, found %s\n' "${#build_scripts[@]}" >&2
+            exit 1
+          }
+          build_script="${build_scripts[0]}"
+          python3 - "${build_script}" <<'PY'
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          old = '.define("OPUS_X86_MAY_HAVE_AVX2", to_opt(DO_RUNTIME_DETECTION));'
+          new = '.define("OPUS_X86_MAY_HAVE_AVX2", "OFF");'
+          text = path.read_text()
+          if text.count(old) != 1:
+              raise SystemExit(
+                  "opusic-sys changed; refusing to apply an unverified compatibility patch"
+              )
+          path.write_text(text.replace(old, new))
+          PY
       - name: Download DSM 7.1 toolchain
         run: |
           set -euo pipefail
