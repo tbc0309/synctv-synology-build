@@ -77,11 +77,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake curl libclang-dev nasm perl protobuf-compiler xz-utils
+      - name: Read upstream Rust toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)"
+          [[ -n "${channel}" ]] || { echo "Unable to read rust-toolchain.toml" >&2; exit 1; }
+          echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
       - name: Install Rust
         # Respect the exact nightly pinned by the checked-out upstream tag.
         # Using @nightly silently moved to a newer compiler every day.
         uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
           targets: ${{ matrix.rust_target }}
       - uses: Swatinem/rust-cache@v2
         with:
@@ -109,7 +118,7 @@ jobs:
           echo "RANLIB_${cc_suffix}=${prefix}-ranlib" >> "${GITHUB_ENV}"
       - name: Build server
         run: |
-          cargo +nightly build --locked --release --target "${{ matrix.rust_target }}" \
+          cargo build --locked --release --target "${{ matrix.rust_target }}" \
             --package synctv --bin synctv --no-default-features \
             --features "tls-ring,tls-webpki-roots"
       - name: Prepare uncompressed binary
