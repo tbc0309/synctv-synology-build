@@ -1,0 +1,128 @@
+name: Test Synology DSM 7.2 toolchain
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/test-dsm72.yml
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Upstream v* tag (blank = latest official release)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: synology-dsm72-test
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      upstream_ref: ${{ steps.version.outputs.upstream_ref }}
+    steps:
+      - name: Select official version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_REF: ${{ github.event.inputs.ref }}
+        run: |
+          set -euo pipefail
+          upstream_ref="${REQUESTED_REF}"
+          if [[ -z "${upstream_ref}" ]]; then
+            upstream_ref="$(gh api repos/synctv-org/synctv/releases/latest --jq .tag_name)"
+          fi
+          [[ "${upstream_ref}" == v* ]] || { echo "Expected a v* tag: ${upstream_ref}" >&2; exit 1; }
+          git ls-remote --exit-code --tags https://github.com/synctv-org/synctv.git "refs/tags/${upstream_ref}" >/dev/null
+          echo "upstream_ref=${upstream_ref}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    needs: prepare
+    name: DSM 7.2 ${{ matrix.synology_arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - synology_arch: amd64
+            rust_target: x86_64-unknown-linux-gnu
+            toolchain_file: avoton-gcc1220_glibc236_x86_64-GPL.txz
+            toolchain_md5: d0673f47d00624140c2e3a0d3d901080
+            archive_path: Intel%20x86%20Linux%203.10.108%20%28Avoton%29
+          - synology_arch: armv8
+            rust_target: aarch64-unknown-linux-gnu
+            toolchain_file: rtd1296-gcc1220_glibc236_armv8-GPL.txz
+            toolchain_md5: 3fa5a0b496a298af7ee28e457959be31
+            archive_path: Realtek%20RTD129x%20Linux%204.4.302
+    env:
+      DSM_TOOLCHAIN_VERSION: 7.2-72806
+      SQLX_OFFLINE: "true"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Checkout SyncTV
+        uses: actions/checkout@v5
+        with:
+          repository: synctv-org/synctv
+          ref: ${{ needs.prepare.outputs.upstream_ref }}
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake curl libclang-dev nasm perl protobuf-compiler xz-utils
+      - name: Read upstream Rust toolchain
+        id: rust-toolchain
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)"
+          [[ -n "${channel}" ]] || { echo "Unable to read rust-toolchain.toml" >&2; exit 1; }
+          echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+          targets: ${{ matrix.rust_target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: synology-dsm72-${{ matrix.synology_arch }}
+      - name: Download DSM 7.2 toolchain
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/${{ matrix.toolchain_file }}"
+          url="https://global.synologydownload.com/download/ToolChain/toolchain/${DSM_TOOLCHAIN_VERSION}/${{ matrix.archive_path }}/${{ matrix.toolchain_file }}"
+          curl --fail --location --retry 3 --output "${archive}" "${url}"
+          echo "${{ matrix.toolchain_md5 }}  ${archive}" | md5sum --check --strict
+          mkdir -p "${RUNNER_TEMP}/synology-toolchain"
+          tar -xJf "${archive}" -C "${RUNNER_TEMP}/synology-toolchain"
+      - name: Configure cross compiler
+        run: |
+          set -euo pipefail
+          linker="$(find "${RUNNER_TEMP}/synology-toolchain" \( -type f -o -type l \) -path '*/bin/*-gcc' -print -quit)"
+          [[ -n "${linker}" ]] || exit 1
+          prefix="${linker%-gcc}"
+          rust_suffix="$(tr '[:lower:]-' '[:upper:]_' <<< '${{ matrix.rust_target }}')"
+          cc_suffix="$(tr '-' '_' <<< '${{ matrix.rust_target }}')"
+          echo "CARGO_TARGET_${rust_suffix}_LINKER=${linker}" >> "${GITHUB_ENV}"
+          echo "CC_${cc_suffix}=${linker}" >> "${GITHUB_ENV}"
+          echo "AR_${cc_suffix}=${prefix}-ar" >> "${GITHUB_ENV}"
+          echo "RANLIB_${cc_suffix}=${prefix}-ranlib" >> "${GITHUB_ENV}"
+      - name: Build server
+        run: |
+          cargo build --locked --release --target "${{ matrix.rust_target }}" \
+            --package synctv --bin synctv --no-default-features \
+            --features "tls-ring,tls-webpki-roots"
+      - name: Prepare uncompressed binary
+        run: |
+          set -euo pipefail
+          output="synctv-dsm72-${{ matrix.synology_arch }}"
+          cp "target/${{ matrix.rust_target }}/release/synctv" "${output}"
+          chmod 755 "${output}"
+          sha256sum "${output}" > "${output}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: synctv-dsm72-${{ matrix.synology_arch }}
+          path: |
+            synctv-dsm72-${{ matrix.synology_arch }}
+            synctv-dsm72-${{ matrix.synology_arch }}.sha256
