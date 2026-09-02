@@ -1,22 +1,24 @@
-name: Test Synology DSM 7.2 toolchain
+name: Build and publish Synology DSM 7.2 binaries
 
 on:
   push:
     branches: [main]
     paths:
-      - .github/workflows/test-dsm72.yml
+      - .github/workflows/build.yml
   workflow_dispatch:
     inputs:
       ref:
         description: Upstream v* tag (blank = latest official release)
         required: false
         type: string
+  schedule:
+    - cron: "20 18 * * *"
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: synology-dsm72-test
+  group: synology-release
   cancel-in-progress: false
 
 jobs:
@@ -24,6 +26,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       upstream_ref: ${{ steps.version.outputs.upstream_ref }}
+      should_build: ${{ steps.version.outputs.should_build }}
     steps:
       - name: Select official version
         id: version
@@ -39,9 +42,17 @@ jobs:
           [[ "${upstream_ref}" == v* ]] || { echo "Expected a v* tag: ${upstream_ref}" >&2; exit 1; }
           git ls-remote --exit-code --tags https://github.com/synctv-org/synctv.git "refs/tags/${upstream_ref}" >/dev/null
           echo "upstream_ref=${upstream_ref}" >> "${GITHUB_OUTPUT}"
+          expected_assets=$'synctv-dsm72-amd64\nsynctv-dsm72-amd64.sha256\nsynctv-dsm72-armv8\nsynctv-dsm72-armv8.sha256'
+          current_assets="$(gh release view "${upstream_ref}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+          if [[ "$(printf '%s\n' "${current_assets}" | sort)" == "$(printf '%s\n' "${expected_assets}" | sort)" ]]; then
+            echo "should_build=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "should_build=true" >> "${GITHUB_OUTPUT}"
+          fi
 
   build:
     needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
     name: DSM 7.2 ${{ matrix.synology_arch }}
     runs-on: ubuntu-24.04
     strategy:
@@ -126,3 +137,30 @@ jobs:
           path: |
             synctv-dsm72-${{ matrix.synology_arch }}
             synctv-dsm72-${{ matrix.synology_arch }}.sha256
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_REF: ${{ needs.prepare.outputs.upstream_ref }}
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: synctv-dsm72-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          if gh release view "${UPSTREAM_REF}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release view "${UPSTREAM_REF}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name' |
+              while IFS= read -r asset; do
+                gh release delete-asset "${UPSTREAM_REF}" "${asset}" --repo "${GITHUB_REPOSITORY}" --yes
+              done
+            gh release upload "${UPSTREAM_REF}" release-assets/* --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${UPSTREAM_REF}" release-assets/* --repo "${GITHUB_REPOSITORY}" \
+              --title "SyncTV ${UPSTREAM_REF} for Synology DSM 7.2" \
+              --notes "Automatically cross-compiled from synctv-org/synctv ${UPSTREAM_REF} with official Synology DSM 7.2 toolchains. Run chmod +x before use."
+          fi
