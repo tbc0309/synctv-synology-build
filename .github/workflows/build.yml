@@ -129,10 +129,31 @@ jobs:
           echo "AR_${cc_suffix}=${prefix}-ar" >> "${GITHUB_ENV}"
           echo "RANLIB_${cc_suffix}=${prefix}-ranlib" >> "${GITHUB_ENV}"
       - name: Build server
+        id: build-server
+        shell: bash
         run: |
+          set -o pipefail
           cargo build --locked --release --target "${{ matrix.rust_target }}" \
             --package synctv --bin synctv --no-default-features \
-            --features "tls-ring,tls-webpki-roots"
+            --features "tls-ring,tls-webpki-roots" 2>&1 | tee "build-${{ matrix.synology_arch }}.log"
+      - name: Report build failure
+        if: failure() && steps.build-server.outcome == 'failure'
+        shell: bash
+        run: |
+          {
+            echo '### DSM 7.1 ${{ matrix.synology_arch }} build failure'
+            echo
+            echo '```text'
+            tail -n 200 "build-${{ matrix.synology_arch }}.log"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-dsm71-${{ matrix.synology_arch }}
+          path: build-${{ matrix.synology_arch }}.log
+          if-no-files-found: warn
       - name: Prepare uncompressed binary
         run: |
           set -euo pipefail
