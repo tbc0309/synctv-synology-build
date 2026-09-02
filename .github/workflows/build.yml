@@ -1,21 +1,22 @@
-name: Build and publish Synology binaries
+name: Test Synology DSM 7.2 toolchain
+
 on:
   push:
     branches: [main]
     paths:
-      - .github/workflows/build.yml
+      - .github/workflows/test-dsm72.yml
   workflow_dispatch:
     inputs:
       ref:
-        description: Upstream v* tag (blank = latest official tag)
+        description: Upstream v* tag (blank = latest official release)
         required: false
         type: string
-  schedule:
-    - cron: "20 18 * * *"
+
 permissions:
-  contents: write
+  contents: read
+
 concurrency:
-  group: synology-release
+  group: synology-dsm72-test
   cancel-in-progress: false
 
 jobs:
@@ -23,7 +24,6 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       upstream_ref: ${{ steps.version.outputs.upstream_ref }}
-      should_build: ${{ steps.version.outputs.should_build }}
     steps:
       - name: Select official version
         id: version
@@ -34,45 +34,34 @@ jobs:
           set -euo pipefail
           upstream_ref="${REQUESTED_REF}"
           if [[ -z "${upstream_ref}" ]]; then
-            # GitHub's latest-release endpoint excludes drafts and prereleases.
             upstream_ref="$(gh api repos/synctv-org/synctv/releases/latest --jq .tag_name)"
           fi
           [[ "${upstream_ref}" == v* ]] || { echo "Expected a v* tag: ${upstream_ref}" >&2; exit 1; }
           git ls-remote --exit-code --tags https://github.com/synctv-org/synctv.git "refs/tags/${upstream_ref}" >/dev/null
           echo "upstream_ref=${upstream_ref}" >> "${GITHUB_OUTPUT}"
-          if gh release view "${upstream_ref}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "should_build=false" >> "${GITHUB_OUTPUT}"
-          else
-            echo "should_build=true" >> "${GITHUB_OUTPUT}"
-          fi
 
   build:
     needs: prepare
-    if: needs.prepare.outputs.should_build == 'true'
-    name: DSM 7.1 ${{ matrix.synology_arch }}
+    name: DSM 7.2 ${{ matrix.synology_arch }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
           - synology_arch: amd64
             rust_target: x86_64-unknown-linux-gnu
-            toolchain_file: avoton-gcc850_glibc226_x86_64-GPL.txz
-            toolchain_md5: 93e6ae9501327554c51a1e045e1b69a1
+            toolchain_file: avoton-gcc1220_glibc236_x86_64-GPL.txz
+            toolchain_md5: d0673f47d00624140c2e3a0d3d901080
             archive_path: Intel%20x86%20Linux%203.10.108%20%28Avoton%29
           - synology_arch: armv8
             rust_target: aarch64-unknown-linux-gnu
-            toolchain_file: rtd1296-gcc850_glibc226_armv8-GPL.txz
-            toolchain_md5: 370aec3c42dd6d9336b82c6a46e7f105
-            archive_path: Realtek%20RTD129x%20Linux%204.4.180
+            toolchain_file: rtd1296-gcc1220_glibc236_armv8-GPL.txz
+            toolchain_md5: 3fa5a0b496a298af7ee28e457959be31
+            archive_path: Realtek%20RTD129x%20Linux%204.4.302
     env:
-      DSM_TOOLCHAIN_VERSION: 7.1-42661
+      DSM_TOOLCHAIN_VERSION: 7.2-72806
       SQLX_OFFLINE: "true"
       CARGO_INCREMENTAL: "0"
-      # v1.0.4 is substantially larger and the x86_64 build can exhaust the
-      # hosted runner when rustc uses the default parallelism.
-      CARGO_BUILD_JOBS: "2"
     steps:
       - name: Checkout SyncTV
         uses: actions/checkout@v5
@@ -85,62 +74,20 @@ jobs:
           sudo apt-get install -y cmake curl libclang-dev nasm perl protobuf-compiler xz-utils
       - name: Read upstream Rust toolchain
         id: rust-toolchain
-        shell: bash
         run: |
           set -euo pipefail
           channel="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)"
           [[ -n "${channel}" ]] || { echo "Unable to read rust-toolchain.toml" >&2; exit 1; }
           echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
       - name: Install Rust
-        # Respect the exact nightly pinned by the checked-out upstream tag.
-        # Using @nightly silently moved to a newer compiler every day.
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.rust-toolchain.outputs.channel }}
           targets: ${{ matrix.rust_target }}
-      - name: Show build environment
-        run: |
-          rustc --version --verbose
-          cargo --version
-          free -h
-          df -h "${RUNNER_TEMP}"
       - uses: Swatinem/rust-cache@v2
         with:
-          key: synology-${{ matrix.synology_arch }}
-      - name: Disable incompatible Opus AVX2 on DSM 7.1 amd64
-        if: matrix.synology_arch == 'amd64'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo fetch --locked --target "${{ matrix.rust_target }}"
-          opusic_version="$(awk '
-            $0 == "name = \"opusic-sys\"" { found = 1; next }
-            found && /^version = / { gsub(/[\" ]/, "", $3); print $3; exit }
-          ' Cargo.lock)"
-          [[ -n "${opusic_version}" ]] || { echo 'opusic-sys is missing from Cargo.lock' >&2; exit 1; }
-          mapfile -t build_scripts < <(
-            find "${CARGO_HOME}/registry/src" -path "*/opusic-sys-${opusic_version}/build.rs" -type f
-          )
-          [[ "${#build_scripts[@]}" -eq 1 ]] || {
-            printf 'Expected one opusic-sys build.rs, found %s\n' "${#build_scripts[@]}" >&2
-            exit 1
-          }
-          build_script="${build_scripts[0]}"
-          python3 - "${build_script}" <<'PY'
-          import pathlib
-          import sys
-
-          path = pathlib.Path(sys.argv[1])
-          old = '.define("OPUS_X86_MAY_HAVE_AVX2", to_opt(DO_RUNTIME_DETECTION));'
-          new = '.define("OPUS_X86_MAY_HAVE_AVX2", "OFF");'
-          text = path.read_text()
-          if text.count(old) != 1:
-              raise SystemExit(
-                  "opusic-sys changed; refusing to apply an unverified compatibility patch"
-              )
-          path.write_text(text.replace(old, new))
-          PY
-      - name: Download DSM 7.1 toolchain
+          key: synology-dsm72-${{ matrix.synology_arch }}
+      - name: Download DSM 7.2 toolchain
         run: |
           set -euo pipefail
           archive="${RUNNER_TEMP}/${{ matrix.toolchain_file }}"
@@ -162,65 +109,20 @@ jobs:
           echo "AR_${cc_suffix}=${prefix}-ar" >> "${GITHUB_ENV}"
           echo "RANLIB_${cc_suffix}=${prefix}-ranlib" >> "${GITHUB_ENV}"
       - name: Build server
-        id: build-server
-        shell: bash
         run: |
-          set -o pipefail
           cargo build --locked --release --target "${{ matrix.rust_target }}" \
             --package synctv --bin synctv --no-default-features \
-            --features "tls-ring,tls-webpki-roots" 2>&1 | tee "build-${{ matrix.synology_arch }}.log"
-      - name: Report build failure
-        if: failure() && steps.build-server.outcome == 'failure'
-        shell: bash
-        run: |
-          {
-            echo '### DSM 7.1 ${{ matrix.synology_arch }} build failure'
-            echo
-            echo '```text'
-            tail -n 200 "build-${{ matrix.synology_arch }}.log"
-            echo '```'
-          } >> "${GITHUB_STEP_SUMMARY}"
-      - name: Upload build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log-dsm71-${{ matrix.synology_arch }}
-          path: build-${{ matrix.synology_arch }}.log
-          if-no-files-found: warn
+            --features "tls-ring,tls-webpki-roots"
       - name: Prepare uncompressed binary
         run: |
           set -euo pipefail
-          output="synctv-dsm71-${{ matrix.synology_arch }}"
+          output="synctv-dsm72-${{ matrix.synology_arch }}"
           cp "target/${{ matrix.rust_target }}/release/synctv" "${output}"
           chmod 755 "${output}"
-          case "${{ matrix.synology_arch }}" in
-            amd64) expected_machine='Advanced Micro Devices X86-64' ;;
-            armv8) expected_machine='AArch64' ;;
-            *) exit 1 ;;
-          esac
-          readelf -h "${output}" | grep -F "Machine:" | grep -F "${expected_machine}"
           sha256sum "${output}" > "${output}.sha256"
       - uses: actions/upload-artifact@v4
         with:
-          name: synctv-dsm71-${{ matrix.synology_arch }}
+          name: synctv-dsm72-${{ matrix.synology_arch }}
           path: |
-            synctv-dsm71-${{ matrix.synology_arch }}
-            synctv-dsm71-${{ matrix.synology_arch }}.sha256
-
-  publish:
-    needs: [prepare, build]
-    runs-on: ubuntu-24.04
-    env:
-      GH_TOKEN: ${{ github.token }}
-      UPSTREAM_REF: ${{ needs.prepare.outputs.upstream_ref }}
-    steps:
-      - uses: actions/download-artifact@v5
-        with:
-          pattern: synctv-dsm71-*
-          path: release-assets
-          merge-multiple: true
-      - name: Publish release
-        run: |
-          gh release create "${UPSTREAM_REF}" release-assets/* --repo "${GITHUB_REPOSITORY}" \
-            --title "SyncTV ${UPSTREAM_REF} for Synology DSM 7.1" \
-            --notes "Automatically cross-compiled from synctv-org/synctv ${UPSTREAM_REF} with official Synology DSM 7.1 toolchains. Run chmod +x before use."
+            synctv-dsm72-${{ matrix.synology_arch }}
+            synctv-dsm72-${{ matrix.synology_arch }}.sha256
